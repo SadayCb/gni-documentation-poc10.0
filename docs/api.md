@@ -2216,10 +2216,366 @@ procedure loan_int_diff_operation(p_trn_date        in date,
 
 **Description**
 
-Runs interest accrual and related loan interest processing for eligible loans in the supplied branch range or for a specific document, using the requested EOD/SOD phase and calculation date. Its selection queries combine loan details, product settings, account configuration and interest-processing controls to determine which contracts are eligible at that stage.
+The `do_int_calculation` procedure performs interest and penalty accrual calculations for eligible loan contracts during End of Day (EOD) or Start of Day (SOD) processing. It is responsible for identifying the loans that require calculation, determining the applicable interest rates and calculation periods, retrieving the relevant account balances, applying contract-specific calculation rules, and generating the corresponding accounting entries.
 
-The procedure works with the last interest calculation date, applicable interest rate and day-count configuration, payment dates, and account balances when preparing calculation periods. Depending on the loan's configuration and processing phase, it calculates the interest amount, handles relevant interest differences or adjustments, and delegates account or plan postings to supporting loan operations. Configured exclusions and checks for missing product settings or incomplete prerequisite processing can prevent a loan from progressing through the next stage. This is a batch operation, not a simple function of principal multiplied by a rate.
+The procedure supports both batch processing across a specified branch range and individual loan processing using a document number. It also manages calculation dates, loan operation history, payment-plan controls, and error handling.
 
+Unlike a simple interest calculation based on a fixed principal and interest rate, this procedure applies multiple calculation mechanisms depending on the loan's configuration, account type, repayment schedule, interest calculation method, working-day calendar, and active calculation restrictions.
+
+##### 1. Loan Selection and Eligibility
+
+The calculation process begins by calling `prepare_loans_for_int_calc`, which prepares loans for the requested processing date and EOD/SOD phase.
+
+After this preparation step, the procedure retrieves eligible loan contracts from `KRD_TEKLIF_DETAY` and their corresponding product configurations from `PKRD_TURKOD_PR`.
+
+A loan is selected for calculation only when the following conditions are satisfied:
+
+- The loan is active and has not been closed (`KDATE IS NULL`).
+- The loan is not configured for tranche-based processing (`WITH_TRANCHE_INFO_YN = 'N'`).
+- The product code is not `50001`, which is explicitly excluded from this calculation process.
+- At least one of the contractual interest rate or penalty rate is nonzero.
+- Interest calculation (`IS_INT_CALC`) or penalty calculation (`IS_PEN_CALC`) is enabled.
+- The loan's `LAST_CALC_ACCESS_DATE` is earlier than the requested processing date.
+- The loan belongs to the specified branch range.
+- If `p_doc_no` is provided, the loan document number matches the supplied value.
+- The loan does not have an applicable exclusion record in `EOD_PROGRAMS_EXCEPTION` for the `LI` operation.
+
+For calculation-date selection, a missing `LAST_INT_CALC_DATE` or `LAST_CALC_ACCESS_DATE` is initially treated as the day preceding the processing date.
+
+Before starting the calculation, the procedure validates several important configuration parameters, including the existence of the loan product, valid interest and penalty calculation flags, supported non-working-day settings, and valid penalty limits.
+
+The current implementation also rejects loans configured with `IS_GRACE_APPLIED_IN_TRS_ACC = 'N'` or `PLAN_INT_POSTING_TYPE = 'ON_DUE_DAY'`.
+
+These validations prevent the calculation from proceeding with unsupported or incomplete configurations.
+
+##### 2. Calculation Period and Date Determination
+
+The procedure determines the applicable calculation dates using `LOAN_API.GET_INTEREST_CALC_DATES`.
+
+The function receives the loan's last calculation-access date, the EOD/SOD processing mode, and the global `INT_CALC_AT` configuration.
+
+The returned collection of dates is processed sequentially for each eligible account.
+
+The procedure also determines the previous and next working days using `GLBL_TARIH`. These dates are particularly important when processing weekends, public holidays, and other non-working periods.
+
+Depending on the configured processing phase, a single execution may calculate accruals covering multiple calendar days rather than exactly one day.
+
+The number of days since the last calculation-access date is checked against the global configuration parameter `MAX_NON_CALC_DAYS_COUNT`.
+
+If the unprocessed period exceeds this limit, the procedure raises an error instead of continuing the calculation.
+
+For each calculation date, `LOAN_API.GET_INTEREST_CALC_INFO` determines the applicable day count and annual calculation denominator using the previous calculation date, current calculation date, interest calculation type, rate type, and rate periodicity.
+
+These values are used in the financial formulas applied throughout the procedure.
+
+##### 3. Account Selection and Calculation Balance
+
+For each eligible loan, the procedure identifies the accounting accounts that participate in interest or penalty calculations.
+
+Account information is retrieved using `CS_ACCOUNT`, `GL_SEGMENT_DEFINE`, `LOAN_INT_CALC_PARAMETERS`, and `LOAN_ACC_TYPES_PR`.
+
+`LOAN_INT_CALC_PARAMETERS` defines the relationship between the accrual account, source account, counter-account type, rate type, and virtual-calculation configuration.
+
+The procedure distinguishes between the account receiving the calculated accrual and the source account whose balance is used as the calculation basis.
+
+Account balances are determined from the net debit and credit amounts:
+
+`ABS(NVL(DAILY_CREDIT, 0) - NVL(DAILY_DEBIT, 0) + NVL(CREDIT, 0) - NVL(DEBIT, 0))`
+
+For regular interest calculations, the corresponding source account balance is used as the initial calculation basis.
+
+For penalty calculations, the balance is processed through `LOAN_API.GET_AMOUNT_FOR_PEN_CALC`.
+
+This function receives the overdue balance and additional parameters controlling whether interest amounts are included in the penalty basis, whether collection amounts are excluded, the minimum overdue principal threshold, and the loan maturity date.
+
+Consequently, the amount used for penalty calculation may differ from the original overdue account balance.
+
+The procedure also identifies the required accounting counter-account through `LOAN_API.GET_GL_ACC_FROM_MATRIX`.
+
+If a required account classification or counter-account cannot be determined, the loan calculation is interrupted with an error.
+
+##### 4. Interest Rate Determination
+
+The applicable interest rate is determined separately for each calculation account and calculation date.
+
+For standard interest calculations (`INT`), the procedure initially uses the contractual interest rate stored in `KRD_TEKLIF_DETAY.FAIZ_ORAN`.
+
+For penalty calculations (`PEN`), the contractual penalty rate stored in `KRD_TEKLIF_DETAY.GEC_F_ORAN` is used.
+
+These initial rates are applied when `INT_CALC_METHOD = 'BY_RATIO'` and the corresponding interest or penalty calculation flag is enabled.
+
+Otherwise, the initial rate is zero.
+
+The effective rate may subsequently be modified by variable-rate configurations, interest calculation suspension periods, or grace-period restrictions.
+
+**Variable Interest Rates**
+
+When the loan has `FLOW_RATE = 'Y'`, the procedure retrieves the applicable rate from `LOAN_FLOW_RATIO_INFO`.
+
+For regular interest, the `INT_RATIO` field is used. For penalty calculations, the `PEN_INT_RATIO` field is used.
+
+The selected rate record must cover the relevant calculation date. For this lookup, the date is limited to the loan maturity date when the processing date exceeds maturity.
+
+If no matching rate record exists or multiple records match the same calculation date, the procedure raises an error.
+
+This mechanism enables different interest or penalty rates to be applied during different periods of the same loan contract.
+
+**Interest Calculation Suspension**
+
+Before calculating the daily accrual, the procedure checks `LOAN_STOP_RATIO_INFO` for an applicable interest or penalty calculation suspension.
+
+The suspension may apply to an individual rate type or to all rate types.
+
+If an active suspension exists and `CALC_INT_IN_STOP = 'N'`, the effective interest rate is set to zero.
+
+The procedure also compares the suspension calculation flag against the account's virtual-calculation configuration. When these values do not match, the effective rate is set to zero.
+
+Account selection additionally considers whether a suspension begins during the EOD/SOD processing interval.
+
+This allows the calculation process to distinguish between ordinary and virtual accrual configurations when suspension operations are involved.
+
+**Grace Period Restrictions**
+
+When `CALC_INT_IN_GRACE = 'N'`, the procedure checks `LOAN_INT_CALC_STOP_FOR_GRACE`.
+
+If a matching record exists for the loan, rate type, and calculation date, the effective rate is set to zero.
+
+As a result, interest or penalty accrual is suppressed for the configured grace-period interval.
+
+##### 5. Standard Interest Calculation
+
+The standard accrual calculation is based on the applicable account balance, effective interest rate, number of calculation days, and annual day-count denominator.
+
+The formula implemented in the procedure is:
+
+**Interest Amount = Calculation Balance × (Interest Rate / 100) × Calculation Days / Year-Day Basis**
+
+Where:
+
+- **Calculation Balance:** The applicable source account balance, including any adjustments required by the calculation logic.
+- **Interest Rate:** The effective contractual or variable interest rate after applying suspension and grace-period restrictions.
+- **Calculation Days:** The number of days returned by `GET_INTEREST_CALC_INFO`.
+- **Year-Day Basis:** The annual calculation denominator returned by `GET_INTEREST_CALC_INFO`.
+
+The day-count values depend on the configured calculation type and periodicity. The exact convention, such as a 360-day or 365-day denominator, is determined by the supporting function rather than being hardcoded in this procedure.
+
+For example, assuming a calculation balance of 100,000, an annual interest rate of 12%, a 365-day denominator, and a three-day calculation period:
+
+`Interest = 100,000 × (12 / 100) × (3 / 365) = 98.63`
+
+This example illustrates the standard formula. The actual calculated amount may differ depending on the account group, payment-plan adjustments, effective interest rate, and calculation-day rules.
+
+##### 6. Account-Specific Calculation Rules
+
+The procedure applies different calculation rules based on the account group defined in `LOAN_ACC_TYPES_PR`.
+
+**Regular Interest — INT**
+
+For accounts belonging to the `INT` group, the procedure checks the loan repayment schedule in `LOAN_PAYMENT_PLAN`.
+
+It retrieves outstanding scheduled principal and interest amounts using the difference between `PAYMENT_AMOUNT` and `PAID_AMOUNT`.
+
+The calculation considers only open payment-plan records and applies date conditions to identify the relevant scheduled obligations.
+
+Outstanding principal amounts matching the applicable calculation date are deducted from the working calculation balance.
+
+The adjusted balance is subsequently used to calculate the daily interest amount.
+
+The procedure also determines the relevant interest payment date and scheduled interest amount. These values are later supplied to the interest difference-handling operation.
+
+This mechanism allows scheduled principal obligations to affect the interest calculation basis on the corresponding dates.
+
+**Overdue Interest — OVD_INT**
+
+For overdue interest accounts, the procedure calculates interest using the applicable overdue source balance and effective rate.
+
+Additional calculations may be required when the processing period contains non-working days.
+
+The procedure identifies the previous working days and checks whether the EOD/SOD processing interval contains a calendar-day gap.
+
+When the applicable conditions are satisfied, it searches `LOAN_PAYMENT_PLAN` for qualifying outstanding scheduled amounts that entered overdue processing during the relevant interval.
+
+Additional interest is calculated using the outstanding scheduled amounts, effective rate, and the day-count fraction returned by `GLBL_FAIZ.DAY_COUNT_BASIS_NEW`.
+
+The resulting additional amount is added to the standard calculated interest.
+
+**Transit Interest — INT_TRS**
+
+Transit interest follows a similar calculation mechanism to overdue interest.
+
+The main difference is that the procedure uses the payment-plan transit date instead of the overdue date when identifying the relevant obligations.
+
+When a non-working-day gap is detected, qualifying scheduled amounts are identified and the corresponding additional interest is calculated.
+
+The additional amount is included in the total transit interest accrual.
+
+**Penalty Calculation — PEN**
+
+Penalty calculation uses the eligible overdue balance determined by `GET_AMOUNT_FOR_PEN_CALC`.
+
+The procedure first determines the applicable penalty rate and calculation-day count.
+
+If `PEN_MAX_CALC_PERIOD_DAYS` is configured, it retrieves the relevant overdue date using `LOAN_API.GET_OVD_DATE`.
+
+The elapsed overdue period is used to determine how many penalty-calculation days remain available.
+
+The number of days used in the current calculation is restricted to the remaining permitted period and cannot exceed the originally determined calculation-day count.
+
+The penalty amount is then calculated using the standard rate-based formula.
+
+For positive penalty amounts, the product-level minimum and maximum calculation amounts are applied:
+
+- If the calculated penalty is below `PEN_CALC_MIN_AMOUNT`, the amount is increased to the configured minimum.
+- If `PEN_CALC_MAX_AMOUNT` is configured and the calculated penalty exceeds it, the amount is reduced to the configured maximum.
+
+These adjustments are applied to the current calculated penalty amount.
+
+For other supported account groups, the procedure applies the standard balance-based accrual calculation.
+
+##### 7. Interest Difference and Precision Handling
+
+After calculating the amount for an individual date, the procedure calls `LOAN_API.LOAN_INT_DIFF_OPERATION`.
+
+The purpose of this step is to process interest calculation differences associated with the calculated amount.
+
+The procedure supplies the original calculated amount, processing date, loan document number, account types, existing accrual account amount, payment date, scheduled interest amount, and EOD/SOD mode.
+
+The calculated amount is passed through an `IN OUT` parameter, allowing the supporting operation to adjust the value before it is accumulated.
+
+The accompanying code comment identifies this step as handling truncated amounts.
+
+The exact precision, rounding, and difference-management rules are implemented in the supporting function.
+
+After this operation, the returned amount is added to the working account amount.
+
+Only positive daily accrual amounts are added to the accumulated amount prepared for accounting posting.
+
+##### 8. Accrual Accumulation and Calculation Details
+
+The procedure accumulates the calculated accruals separately for each applicable account.
+
+For every positive daily amount, the following information is updated:
+
+- Total calculated accrual amount.
+- Total applicable calculation days.
+- Latest interest calculation date.
+
+The procedure also records detailed calculation information using the loan API additional-data mechanism.
+
+The recorded information includes the account type, calculation date, day count, calculation balance, calculated amount, effective interest rate, account identifier, and original account reference.
+
+These details are organized into calculation groups, allowing the operation to retain information about the individual accrual components.
+
+The EOD/SOD processing phase is also recorded in the additional information.
+
+This metadata provides context for reviewing the calculation and identifying the values used during processing.
+
+##### 9. Accounting Entry Generation
+
+After completing the calculation dates for an account, the procedure checks the accumulated interest or penalty amount.
+
+If the amount is positive, it prepares accounting entries using `LOAN_API.G_ENTRIES_LIST_REC`.
+
+A debit entry is created for the corresponding accrual account.
+
+The debit entry contains the branch identifier, account number, account subnumber, amount, and transaction description.
+
+A matching credit entry is prepared using the counter-account determined from the accounting matrix.
+
+The credit account subnumber is formed using `9000 + CURRENCY_ID`.
+
+Additional credit-side accounting segment information includes the product identifier, period identifier, and customer type.
+
+Transaction descriptions are generated through `LOAN_REPORT_API.GET_LOAN_MESSAGE`.
+
+The debit and credit amounts are equal for each prepared accounting entry pair.
+
+All prepared entries are collected in an accounting-entry list.
+
+After the loan's eligible accounts have been processed, the entries are posted using `LOAN_API.DO_JOURNAL_ENTRY`.
+
+The posting operation uses a transaction identifier obtained from `TRN_BROKER.GET_ID`, the configured transaction caller, transaction type `POST`, and EOD posting flag `Y`.
+
+Accounting posting is performed only when the entry collection contains at least one calculated accrual.
+
+##### 10. Calculation State and Loan History
+
+After processing the account calculations, the procedure prepares updates to the loan's calculation-related fields.
+
+The affected fields include:
+
+- `CALC_INT_IN_STOP`
+- `LAST_CALC_ACCESS_DATE`
+- `LAST_INT_CALC_DATE`
+
+`LAST_CALC_ACCESS_DATE` is updated using the final processed calculation date.
+
+`LAST_INT_CALC_DATE` is prepared for updating when accounting entries have been generated.
+
+`CALC_INT_IN_STOP` is included in the recorded column changes using its original and final working values.
+
+The changes are finalized through `LOAN_API.FINALIZE_ADDTIONAL_PROCESS`.
+
+If accounting entries exist, the procedure posts them and registers the operation through `LOAN_API.CREATE_LOAN_HISTORY`.
+
+The history operation records the loan document number, business date, transaction identifier, operation type `INT_CALCULATION`, and transaction type `I`.
+
+If no accounting entries are generated, the procedure clears the additional-data state without executing the accounting posting or history creation branch.
+
+##### 11. Payment Plan Control
+
+After the calculation and accounting operations, the procedure calls `GAIA.LOAN_API.DO_PLAN_CONTROL`.
+
+The control date depends on the processing mode.
+
+For SOD processing, the requested processing date is supplied.
+
+For EOD processing, the control date is the earlier of the next working day and the first calendar day of the following month.
+
+This step connects the interest calculation process with the loan payment-plan control mechanism.
+
+The exact validation or modification operations performed by `DO_PLAN_CONTROL` are defined in that supporting procedure.
+
+##### 12. Error Handling and Transaction Control
+
+The procedure handles errors separately for each loan contract.
+
+Before processing a contract, it removes the corresponding previous batch-error record using `GNI_UTILITY.DELETE_BATCH_ERROR`.
+
+If an error occurs during calculation or posting, the exception handler executes a rollback and records the error through `GNI_UTILITY.LOG_BATCH_ERROR`.
+
+The error record includes the transaction identifier, business date, operation type, branch parameter, loan document number, and Oracle error message.
+
+The exception is handled inside the loan-processing loop, allowing the procedure to continue processing subsequent eligible contracts.
+
+Successful loan processing is followed by a commit.
+
+Errors may occur because of missing product configurations, invalid calculation parameters, unavailable accounting mappings, missing variable-rate records, overlapping configuration periods, excessive unprocessed days, invalid rates, or errors raised by dependent operations.
+
+After completing the batch, the procedure calls `GNI_UTILITY.HAS_BATCH_ERROR` to check the recorded error state.
+
+This approach supports contract-level error isolation during batch interest calculation.
+
+##### 13. Business Logic Summary
+
+The overall calculation process follows these stages:
+
+1. Prepare loans for the selected EOD/SOD processing phase.
+2. Select eligible contracts based on status, product configuration, branch, and processing date.
+3. Validate calculation settings and required prerequisites.
+4. Generate the applicable interest calculation dates.
+5. Identify accrual accounts, source balances, and counter-accounts.
+6. Determine the effective interest or penalty rate for each date.
+7. Apply suspension, variable-rate, and grace-period restrictions.
+8. Calculate accruals according to the applicable account group and day-count rules.
+9. Apply payment-plan adjustments, overdue/transit handling, and penalty restrictions.
+10. Process interest calculation differences and accumulate positive accrual amounts.
+11. Prepare and post the corresponding debit and credit accounting entries.
+12. Update loan calculation metadata and create operation history where applicable.
+13. Execute payment-plan control and commit successful contract processing.
+14. Record failures and check the batch-error state.
+
+**Important:** The procedure coordinates multiple supporting loan API operations. Its financial accuracy depends not only on the logic implemented directly in `do_int_calculation`, but also on the behavior of the date-calculation, balance-selection, interest-difference, accounting-posting, and payment-plan control functions it invokes.
 **Signature**
 
 ```sql
