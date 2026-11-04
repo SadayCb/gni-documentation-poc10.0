@@ -92,7 +92,7 @@ Calculates or retrieves interest, penalty bases, rates, and recognition informat
 **Procedures**
 - [get_interest_calc_info](#get-interest-calc-info)
 - [loan_int_diff_operation](#loan-int-diff-operation)
-- [_calculation](#do-int-calculation)
+- [do_int_calculation](#do-int-calculation)
 - [do_commission_recognition](#do-commission-recognition)
 
 **Functions**
