@@ -92,7 +92,7 @@ Calculates or retrieves interest, penalty bases, rates, and recognition informat
 **Procedures**
 - [get_interest_calc_info](#get-interest-calc-info)
 - [loan_int_diff_operation](#loan-int-diff-operation)
-- [do_int_calculation](#do-int-calculation)
+- [_calculation](#do-int-calculation)
 - [do_commission_recognition](#do-commission-recognition)
 
 **Functions**
@@ -2576,6 +2576,7 @@ The overall calculation process follows these stages:
 14. Record failures and check the batch-error state.
 
 **Important:** The procedure coordinates multiple supporting loan API operations. Its financial accuracy depends not only on the logic implemented directly in `do_int_calculation`, but also on the behavior of the date-calculation, balance-selection, interest-difference, accounting-posting, and payment-plan control functions it invokes.
+
 **Signature**
 
 ```sql
